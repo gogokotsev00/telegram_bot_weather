@@ -94,6 +94,16 @@ async def add_city(chat_id, city):
         else:
             await conn.execute('INSERT INTO user_prefs (chat_id, cities, timezone) VALUES ($1, $2, $3)', chat_id, [city], 'UTC')
 
+async def remove_city(chat_id, city):
+    if not db_pool: return
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT cities FROM user_prefs WHERE chat_id = $1', chat_id)
+        if row:
+            cities = row['cities'] or []
+            if city in cities:
+                cities.remove(city)
+                await conn.execute('UPDATE user_prefs SET cities = $1 WHERE chat_id = $2', cities, chat_id)
+
 async def set_user_time(chat_id, time_str, timezone_str):
     if not db_pool: return
     async with db_pool.acquire() as conn:
@@ -135,8 +145,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = (
         "Hello! I can send you daily weather forecasts. 🌍\n\n"
         "1. Add a city: <code>/setcity &lt;City&gt;</code> (You can add multiple)\n"
-        "2. Set your time and timezone: <code>/settime &lt;HH:MM&gt; &lt;Timezone/Offset&gt;</code> (e.g. /settime 08:30 Europe/Berlin or /settime 08:30 +02:00)\n"
-        "3. Show selection: <code>/showSelected</code>"
+        "2. Remove a city: <code>/removecity &lt;City&gt;</code>\n"
+        "3. Set your time and timezone: <code>/settime &lt;HH:MM&gt; &lt;Timezone/Offset&gt;</code> (e.g. /settime 08:30 Europe/Berlin or /settime 08:30 +02:00)\n"
+        "4. Show selection: <code>/showSelected</code>"
     )
     await update.effective_message.reply_text(welcome_message, parse_mode="HTML")
 
@@ -151,6 +162,23 @@ async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await add_city(chat_id, city)
     
     await update.effective_message.reply_text(f"✅ City <b>{city}</b> successfully added to your list!", parse_mode="HTML")
+
+async def remove_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    
+    if not context.args:
+        await update.effective_message.reply_text("Please provide a city. Example: <code>/removecity Berlin</code>", parse_mode="HTML")
+        return
+    
+    city = " ".join(context.args)
+    user = await get_user(chat_id)
+    cities = user.get("cities", [])
+    
+    if city in cities:
+        await remove_city(chat_id, city)
+        await update.effective_message.reply_text(f"✅ City <b>{city}</b> successfully removed from your list!", parse_mode="HTML")
+    else:
+        await update.effective_message.reply_text(f"❌ City <b>{city}</b> is not in your list.", parse_mode="HTML")
 
 async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -266,6 +294,7 @@ def main():
     # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setcity", set_city))
+    app.add_handler(CommandHandler("removecity", remove_city_handler))
     app.add_handler(CommandHandler("settime", set_time))
     app.add_handler(CommandHandler(["showselected", "showSelected"], show_selected))
     
