@@ -1,12 +1,10 @@
-import asyncio
 import datetime
 import os
-import sys
+import httpx
+import asyncpg
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
-import requests
-import psycopg2
 
 try:
     from dotenv import load_dotenv
@@ -21,72 +19,65 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 if not TELEGRAM_BOT_API_TOKEN or not OPEN_WEATHER_API_TOKEN:
     raise ValueError("API tokens missing! Please set TELEGRAM_BOT_API_TOKEN and OPEN_WEATHER_API_TOKEN environment variables or in a .env file.")
 
-# --- Database Logic ---
-def get_db_connection():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL is not set!")
-    return psycopg2.connect(DATABASE_URL)
+db_pool = None
 
-def init_db():
-    if not DATABASE_URL:
+async def post_init(app: Application):
+    global db_pool
+    if DATABASE_URL:
+        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        async with db_pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS user_prefs (
+                    chat_id BIGINT PRIMARY KEY,
+                    cities TEXT[],
+                    notification_time VARCHAR(5)
+                )
+            ''')
+        await restore_jobs(app)
+    else:
         print("DATABASE_URL not set, skipping DB initialization.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS user_prefs (
-            chat_id BIGINT PRIMARY KEY,
-            cities TEXT[],
-            notification_time VARCHAR(5)
-        )
-    ''')
-    conn.commit()
-    cur.close()
-    conn.close()
 
-def get_user(chat_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT cities, notification_time FROM user_prefs WHERE chat_id = %s', (chat_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+async def post_shutdown(app: Application):
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+
+# --- Database Logic ---
+async def get_user(chat_id):
+    if not db_pool:
+        return {"cities": [], "time": None}
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT cities, notification_time FROM user_prefs WHERE chat_id = $1', chat_id)
     if row:
-        return {"cities": row[0] or [], "time": row[1]}
+        return {"cities": row['cities'] or [], "time": row['notification_time']}
     return {"cities": [], "time": None}
 
-def add_city(chat_id, city):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT cities FROM user_prefs WHERE chat_id = %s', (chat_id,))
-    row = cur.fetchone()
-    if row:
-        cities = row[0] or []
-        if city not in cities:
-            cities.append(city)
-            cur.execute('UPDATE user_prefs SET cities = %s WHERE chat_id = %s', (cities, chat_id))
-    else:
-        cur.execute('INSERT INTO user_prefs (chat_id, cities) VALUES (%s, %s)', (chat_id, [city]))
-    conn.commit()
-    cur.close()
-    conn.close()
+async def add_city(chat_id, city):
+    if not db_pool: return
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT cities FROM user_prefs WHERE chat_id = $1', chat_id)
+        if row:
+            cities = row['cities'] or []
+            if city not in cities:
+                cities.append(city)
+                await conn.execute('UPDATE user_prefs SET cities = $1 WHERE chat_id = $2', cities, chat_id)
+        else:
+            await conn.execute('INSERT INTO user_prefs (chat_id, cities) VALUES ($1, $2)', chat_id, [city])
 
-def set_user_time(chat_id, time_str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT 1 FROM user_prefs WHERE chat_id = %s', (chat_id,))
-    if cur.fetchone():
-        cur.execute('UPDATE user_prefs SET notification_time = %s WHERE chat_id = %s', (time_str, chat_id))
-    else:
-        cur.execute('INSERT INTO user_prefs (chat_id, cities, notification_time) VALUES (%s, %s, %s)', (chat_id, [], time_str))
-    conn.commit()
-    cur.close()
-    conn.close()
+async def set_user_time(chat_id, time_str):
+    if not db_pool: return
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT 1 FROM user_prefs WHERE chat_id = $1', chat_id)
+        if row:
+            await conn.execute('UPDATE user_prefs SET notification_time = $1 WHERE chat_id = $2', time_str, chat_id)
+        else:
+            await conn.execute('INSERT INTO user_prefs (chat_id, cities, notification_time) VALUES ($1, $2, $3)', chat_id, [], time_str)
 
 # --- Weather Fetching Logic ---
-def get_weather(city: str) -> str:
+async def get_weather(city: str) -> str:
     url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPEN_WEATHER_API_TOKEN}&units=metric"
-    response = requests.get(url)
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
     
     if response.status_code == 200:
         data = response.json()
@@ -99,14 +90,14 @@ def get_weather(city: str) -> str:
 # --- Scheduled Job ---
 async def send_daily_forecast(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    user = get_user(chat_id)
+    user = await get_user(chat_id)
     cities = user.get("cities", []) 
     
     if not cities:
         cities = ["Berlin"] # Default
         
     for city in cities:
-        forecast = get_weather(city)
+        forecast = await get_weather(city)
         await context.bot.send_message(chat_id=chat_id, text=forecast, parse_mode="HTML")
 
 # --- Command Handlers ---
@@ -127,7 +118,7 @@ async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     city = " ".join(context.args)
-    add_city(chat_id, city)
+    await add_city(chat_id, city)
     
     await update.effective_message.reply_text(f"✅ City <b>{city}</b> successfully added to your list!", parse_mode="HTML")
 
@@ -139,7 +130,7 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     time_str = context.args[0]
-    user = get_user(chat_id)
+    user = await get_user(chat_id)
     
     # Ensure they have set at least one city first
     if not user.get("cities"):
@@ -163,7 +154,7 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name=str(chat_id)
         )
         
-        set_user_time(chat_id, time_str)
+        await set_user_time(chat_id, time_str)
         
         cities_str = ", ".join(user["cities"])
         await update.effective_message.reply_text(f"⏰ All set! I will send the daily forecast for <b>{cities_str}</b> at <b>{time_str} UTC</b>.", parse_mode="HTML")
@@ -173,7 +164,7 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user = get_user(chat_id)
+    user = await get_user(chat_id)
     
     cities = user.get("cities", [])
     cities_str = ", ".join(cities) if cities else "Not set"
@@ -191,17 +182,15 @@ async def log_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'Update {update} caused error {context.error}')
 
 # --- Main Application Setup ---
-def restore_jobs(app: Application):
-    if not DATABASE_URL:
+async def restore_jobs(app: Application):
+    if not db_pool:
         return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT chat_id, notification_time FROM user_prefs WHERE notification_time IS NOT NULL')
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('SELECT chat_id, notification_time FROM user_prefs WHERE notification_time IS NOT NULL')
     
-    for chat_id, time_str in rows:
+    for row in rows:
+        chat_id = row['chat_id']
+        time_str = row['notification_time']
         try:
             hour, minute = map(int, time_str.split(':'))
             t = datetime.time(hour=hour, minute=minute, tzinfo=datetime.timezone.utc)
@@ -215,9 +204,6 @@ def restore_jobs(app: Application):
             print(f"Failed to restore job for {chat_id}: {e}")
 
 def main():
-
-    init_db()
-
     # Configure robust connection timeouts and pool sizes to prevent ConnectError
     request = HTTPXRequest(connection_pool_size=8, read_timeout=30.0, write_timeout=30.0, connect_timeout=30.0, pool_timeout=10.0)
     get_updates_request = HTTPXRequest(connection_pool_size=1, read_timeout=50.0, write_timeout=50.0, connect_timeout=30.0, pool_timeout=10.0)
@@ -228,6 +214,8 @@ def main():
         .token(TELEGRAM_BOT_API_TOKEN)
         .request(request)
         .get_updates_request(get_updates_request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -240,12 +228,9 @@ def main():
     # Register error handler
     app.add_error_handler(log_error)
 
-    # Restore scheduled jobs from database
-    restore_jobs(app)
-
     # Start the bot (drop_pending_updates ignores lingering connections from restarted instances)
     print("Bot is starting...")
-    app.run_polling(poll_interval=1, drop_pending_updates=True)
+    app.run_polling(poll_interval=2, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
