@@ -1,0 +1,35 @@
+version: '5.3.1'
+
+services:
+  bot:
+    build: .
+    container_name: weather_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # This overrides any DATABASE_URL in your .env file
+      # so that it points to the docker 'db' service instead of a local instance.
+      - DATABASE_URL=postgresql://weather_user:weather_pass@db:5432/weather_db
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:18.4-alpine
+    container_name: weather_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: weather_user
+      POSTGRES_PASSWORD: weather_pass
+      POSTGRES_DB: weather_db
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weather_user -d weather_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
