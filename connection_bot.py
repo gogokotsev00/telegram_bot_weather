@@ -146,7 +146,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Hello! I can send you daily weather forecasts. 🌍\n\n"
         "1. Add a city: <code>/setcity &lt;City&gt;</code> (You can add multiple)\n"
         "2. Remove a city: <code>/removecity &lt;City&gt;</code>\n"
-        "3. Set your time and timezone: <code>/settime &lt;HH:MM&gt; &lt;Timezone/Offset&gt;</code> (e.g. /settime 08:30 Europe/Berlin or /settime 08:30 +02:00)\n"
+        "3. Set you notification time and timezone: <code>/settime &lt;HH:MM&gt; &lt;Timezone/Offset&gt;</code> (e.g. /settime 08:30 Europe/Berlin or /settime 08:30 +02:00)\n"
         "4. Show selection: <code>/showSelected</code>"
     )
     await update.effective_message.reply_text(welcome_message, parse_mode="HTML")
@@ -239,7 +239,7 @@ async def show_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
         "📌 <b>Your Current Selection:</b>\n"
         f"🏙 <b>Cities:</b> {cities_str}\n"
-        f"⏰ <b>Time:</b> {time_str} ({tz_str})"
+        f"⏰ <b>Notification Time:</b> {time_str} ({tz_str})"
     )
     await update.effective_message.reply_text(message, parse_mode="HTML")
 
